@@ -211,6 +211,59 @@ void
 vmxinit(void)
 {
   /* HW1 part 1: write this function; see HW1.md. */
+  /* is vmx support on this host ?*/
+  uint a, b, c, d, id;
+  uint fc, cr0, cr4;
+  char *region;
+
+  id = cpuid();
+  // CPUID with EAX = 1
+                //eax, ebx, ecd, edx
+  cpuid_insn(1, &a, &b, &c, &d);
+  if (!(c & CPUID1_ECX_VMX)) {
+      cprintf("cpu %d: no VMX support\n", id);
+      return;
+  }
+  /* if it is supported, can we enable it? */
+  fc = rdmsr(MSR_IA32_FEATURE_CONTROL);
+  if (!(fc & FEATURE_CONTROL_LOCKED)) {
+    // it is not locked, we can change it
+    // we set it lock here, so no one else can change it
+    fc |= FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_VMXON_OUTSIDE_SMX;
+    wrmsr(MSR_IA32_FEATURE_CONTROL, fc);
+  }
+  if (!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) {
+    cprintf("cpu %d: VMX disabled by firmware (locked)\n", id);
+  }
+  /* 26.8: make cr0 and cr4 legal for vmx */
+  cr0 = rcr0();
+  // all bit listed by fixed0 must be 1, so we use or here
+  // it won't change original bit 1 of cr0
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0); // read bit from cr0 fixed0
+  // all bit listed by fixed1 may be 1, so we use and here
+  // it will clear bit 0s out, but keeps all bit 1 of both cr0  and fixed1
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1); // read bit from cr0 fixed1
+  lcr0(cr0);
+  cr4 = rcr4();
+  cr4 |= rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  lcr4(cr4);
+  /* Create a region for vmxon (reside in memeory) */
+  vmcs_revision = rdmsr(MSR_IA32_VMX_BASIC) & 0x7FFFFFFF;
+  if ((region = kalloc()) == 0) {
+    cprintf("cpu %d: no memory for the VMXON region\n", id);
+    return;
+  }
+  memset(region, 0, PGSIZE);
+  *(uint*)region = vmcs_revision;
+  /* Execute vmxon*/
+  if (vmxon(V2P(region)) < 0) {
+    cprintf("vmxon failed\n");
+    kfree(region);
+    return;
+  }
+  cpus[id].vmx_ok = 1;
+  cprintf("cpu %d: VMX enabled\n", id);
 }
 
 /*
