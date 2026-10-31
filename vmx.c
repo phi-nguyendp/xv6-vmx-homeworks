@@ -52,6 +52,7 @@
 #include "spinlock.h"
 #include "vmx.h"
 #include "vmxapi.h"
+#include <threads.h>
 
 /* Maximum number of VMs in the whole system (all processes). */
 #define NVM 4
@@ -234,6 +235,7 @@ vmxinit(void)
   }
   if (!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) {
     cprintf("cpu %d: VMX disabled by firmware (locked)\n", id);
+    return;
   }
   /* 26.8: make cr0 and cr4 legal for vmx */
   cr0 = rcr0();
@@ -357,7 +359,35 @@ static uint64*
 eptwalk(uint64 *pml4, uint64 gpa, int alloc)
 {
   /* HW1 part 2: write this function; see HW1.md. */
-  return 0;
+  uint64 *table = pml4, *e;
+  char *next;
+  int level;
+
+  for (level = 3; level > 0; level--) {
+    // be cause we are traveling backward, we are going to ready from
+    // the begining of address:
+    // 47, 38, 29
+    e = &table[(gpa >> (12 + 9 *level)) & 0x1FF];
+    if (*e & EPT_RWX) {
+      // at least one bit in 0:2 is set, range is present bit (51:12) are phiscal 
+      // address of the nexxt table.
+      // kernel only work with virtual address, so we convert table address
+      // to virtual
+      table = (uint64*)P2V(EPT_ADDR(*e));
+    } else {
+      // entry is not present, we try to create tables if `alloc` is set
+      // failed to alloc a page to hold the next page table level
+      if (!alloc || (next = kalloc()) == 0) 
+        return 0;
+      memset(next, 0, PGSIZE);
+      // kalloc return virtual address, but we must store physical address
+      // in page table, so use V2P to convert.
+      *e = V2P(next) | EPT_RWX;
+      table = (uint64*)next;
+    }
+  }
+  // if we are still here, the `table` is pointing to the EPT page table entry
+  return &table[PTX(gpa)];
 }
 
 /*
@@ -435,6 +465,103 @@ vmcreate(char *image, int len, int memsz)
   int id, n, off, r;
 
   /* HW1 part 2: write this function; see HW1.md. */
+  if (memsz <= 0 || memsz > VM_MAXMEM || len < 0 || VM_LOAD_ADDR + len > memsz)
+    return -1;
+  // B2: Check that this CPU is in VMX operation
+  // save current flags and disable interrupt (so we will not jump to another cpu
+  // in the middle of execution)
+  pushcli();
+  r = mycpu()->vmx_ok;
+  popcli();
+  if (!r)
+    return -1;
+  // B3: Check the EPT capabilites
+  need = EPT_CAP_WALK_4 | EPT_CAP_MEMTYPE_WB | EPT_CAP_INVEPT|EPT_CAP_INVEPT_SINGLE;
+  if ((rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) & need) != need) {
+    cprintf("vmx: CPU lacks required EPT features\n");
+    return -1;
+  }
+  // B4: Claim a slot in the VM table
+  acquire(&vms.lock);
+  for (id = 0; id < NVM; id++) {
+    // found an empty slot
+    if (!vms.vm[id].used)
+      break;
+  }
+  // out of slots
+  if (id == NVM) {
+    release(&vms.lock);
+    return -1;
+  }
+  vm = &vms.vm[id];
+  // Zero out everything
+  memset(vm, 0, sizeof(*vm));
+  vm->used = 1;
+  vm->owner = myproc();
+  release(&vms.lock);
+
+  vm->memsz = PGROUNDUP(memsz);
+  vm->rflags = 0x2;
+
+  // B5: Allocate the VMCS page
+  if ((vm->vmcs = kalloc()) == 0) {
+    goto bad;
+  }
+  memset(vm->vmcs,0, PGSIZE);
+  
+  //B6: Allocate the EPT root abd build the EPTP
+  if ((vm->ept = (uint64*)kalloc()) == 0) {
+    goto bad; // can not allocate page to store ept
+  }
+  memset(vm->ept, 0, PGSIZE); // must be zeroed, (so bit present is not set)
+  // EPT pointer 
+  vm->eptp = V2P(vm->ept) |  EPTP_WALK_4 | EPTP_MEMTYPE_WB;
+
+  // B7: Allocate and map the guest’s memory
+  for (gpa = 0; gpa < vm->memsz; gpa += PGSIZE) {
+    // for each guest memory page, try to create a PT entry
+    if((pte = eptwalk(vm->ept, gpa, 1)) == 0 || (mem = kalloc()) == 0)
+      goto bad;
+    memset(mem, 0, PGSIZE);
+    *pte = V2P(mem) | EPT_RWX | EPT_MEMTYPE_WB;
+  }
+  // Step B8: Copy the image into guest memory
+  for(off = 0; off < len; off += n){
+    // page by page: because the host address may not be continous
+    gpa = VM_LOAD_ADDR + off;
+    /* Bytes left in this guest page, capped by the bytes left to copy. */
+    n = PGSIZE - gpa % PGSIZE;
+    if(n > len - off)
+      n = len - off;
+    /* Already populated above (the size check guarantees it). */
+    pte = eptwalk(vm->ept, gpa, 0);
+    memmove((char*)P2V(EPT_ADDR(*pte)) + gpa % PGSIZE, image + off, n);
+  }
+  // DEBUG
+  cprintf("vmcreate: vm %d, memsz %x, eptp %x\n", id, vm->memsz, vm->eptp);
+  pte = eptwalk(vm->ept, VM_LOAD_ADDR, 0);
+  cprintf("image word %x, guest word %x\n", (uint64)*(uint*)image,
+          (uint64)*(uint*)P2V(EPT_ADDR(*pte)));
+  // Step B9: Prepare the VMCS 
+  *(uint*)vm->vmcs = vmcs_revision;
+  pushcli();
+  if(!mycpu()->vmx_ok || vmclear(V2P(vm->vmcs)) < 0 || vmptrld(V2P(vm->vmcs)) < 0){
+    popcli();
+    goto bad;
+  }
+  r = vmcsinit(vm);
+  /*
+   * Always VMCLEAR when done, even on error, so no CPU holds the
+   * VMCS cached and it can be freed or loaded elsewhere.
+   */
+  vmclear(V2P(vm->vmcs));
+  popcli();
+  if(r < 0)
+    goto bad;
+  return id;
+
+bad:
+  vmfree(vm);
   return -1;
 }
 
