@@ -431,7 +431,8 @@ vmcsinit(struct vm *vm)
   vmwrite(CR0_READ_SHADOW, 0);
   vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
   vmwrite(CR4_READ_SHADOW, 0);
-
+  
+  // later when vm exit happens, cpu will load RIP from this address
   vmwrite(HOST_RIP, (uint64)vmx_exit);
 
   /* Guest control registers. */
@@ -498,6 +499,47 @@ static void
 vmxhoststate(void)
 {
   /* HW1 part 4: write this function; see HW1.md. */
+  struct cpu *c = mycpu();
+  // store control registers of host to the vmcs
+  // n exit, the CPU loads them back, so the kernel finds itself in the 
+  // same address space and with the same paging mode as before the entry.
+  vmwrite(HOST_CR0, rcr0());
+  vmwrite(HOST_CR3, rcr3());
+  vmwrite(HOST_CR4, rcr4());
+   /*
+   * Selectors.  Host selectors must have RPL = 0 and TI = 0, and CS
+   * and TR must be nonzero.  CS is the kernel code segment; the data
+   * segment registers are not used in 64-bit mode so a null selector
+   * is fine (allowed since the host is 64-bit).
+   */
+  vmwrite(HOST_CS_SELECTOR, SEG_KCODE << 3);
+  vmwrite(HOST_SS_SELECTOR, 0);
+  vmwrite(HOST_DS_SELECTOR, 0);
+  vmwrite(HOST_ES_SELECTOR, 0);
+  vmwrite(HOST_FS_SELECTOR, 0);
+  vmwrite(HOST_GS_SELECTOR, 0);
+  vmwrite(HOST_TR_SELECTOR, SEG_TSS << 3);
+    /*
+   * Segment bases.  FS/GS bases live in MSRs, and a VM exit loads them
+   * from these fields, so we write back the current values and the
+   * exit leaves them unchanged.  (xv6-64 does not use them for per-CPU
+   * data; mycpu() finds the CPU from its local APIC id.)  The exit
+   * does not read the TR, GDTR or IDTR from memory; it takes their
+   * bases from these fields, so they must name this CPU's TSS and GDT
+   * and the kernel's IDT.
+   */
+  vmwrite(HOST_FS_BASE, rdmsr(MSR_IA32_FS_BASE));
+  vmwrite(HOST_GS_BASE, rdmsr(MSR_IA32_GS_BASE));
+  vmwrite(HOST_TR_BASE, (uint64)&c->ts);
+  vmwrite(HOST_GDTR_BASE, (uint64)c->gdt);
+  vmwrite(HOST_IDTR_BASE, (uint64)idt);
+
+    /* The kernel does not use SYSENTER; load zeros on exit. */
+  vmwrite(HOST_IA32_SYSENTER_CS, 0);
+  vmwrite(HOST_IA32_SYSENTER_ESP, 0);
+  vmwrite(HOST_IA32_SYSENTER_EIP, 0);
+  /* Loaded on exit because we set EXIT_LOAD_IA32_EFER in vmcsinit(). */
+  vmwrite(HOST_IA32_EFER, rdmsr(EFER_MSR));
 }
 
 /*
