@@ -221,19 +221,19 @@ vmxinit(void)
   // CPUID with EAX = 1
                 //eax, ebx, ecd, edx
   cpuid_insn(1, &a, &b, &c, &d);
-  if (!(c & CPUID1_ECX_VMX)) {
+  if(!(c & CPUID1_ECX_VMX)) {
       cprintf("cpu %d: no VMX support\n", id);
       return;
   }
   /* if it is supported, can we enable it? */
   fc = rdmsr(MSR_IA32_FEATURE_CONTROL);
-  if (!(fc & FEATURE_CONTROL_LOCKED)) {
+  if(!(fc & FEATURE_CONTROL_LOCKED)) {
     // it is not locked, we can change it
     // we set it lock here, so no one else can change it
     fc |= FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_VMXON_OUTSIDE_SMX;
     wrmsr(MSR_IA32_FEATURE_CONTROL, fc);
   }
-  if (!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) {
+  if(!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) {
     cprintf("cpu %d: VMX disabled by firmware (locked)\n", id);
     return;
   }
@@ -252,14 +252,14 @@ vmxinit(void)
   lcr4(cr4);
   /* Create a region for vmxon (reside in memeory) */
   vmcs_revision = rdmsr(MSR_IA32_VMX_BASIC) & 0x7FFFFFFF;
-  if ((region = kalloc()) == 0) {
+  if((region = kalloc()) == 0) {
     cprintf("cpu %d: no memory for the VMXON region\n", id);
     return;
   }
   memset(region, 0, PGSIZE);
   *(uint*)region = vmcs_revision;
   /* Execute vmxon*/
-  if (vmxon(V2P(region)) < 0) {
+  if(vmxon(V2P(region)) < 0) {
     cprintf("vmxon failed\n");
     kfree(region);
     return;
@@ -289,7 +289,20 @@ static int
 adjustctl(uint msr, uint want, uint *ctl)
 {
   /* HW1 part 3: write this function; see HW1.md. */
-  return -1;
+  uint64 cap = rdmsr(msr);
+  /*
+   * Force on the required bits (low half, OR), then mask off the
+   * unsupported ones (high half, AND).
+   */
+  uint v = (want | (uint)cap) & (uint)(cap >> 32);
+
+  if((v & want) != want) {
+    cprintf("vmx: controls 0x%x unsupported (MSR 0x%x)\n",
+            (uint64)(want & ~v), (uint64)msr);
+    return -1;
+  }
+  *ctl = v;
+  return 0;
 }
 
 /*
@@ -324,6 +337,151 @@ static int
 vmcsinit(struct vm *vm)
 {
   /* HW1 part 3: write this function; see HW1.md. */
+  uint pin, cpu, cpu2, exitctl, entryctl;
+  /*
+   * IA32_VMX_BASIC bit 55 says that the "TRUE" capability MSRs exist.
+   * They report the real default-1 controls; the older MSRs force
+   * some bits (like CR3-load exiting) to 1 on old CPUs.
+   */
+  int t = (rdmsr(MSR_IA32_VMX_BASIC) & VMX_BASIC_TRUE_CTLS) != 0;
+  uint64 cr0, cr4;
+  int seg;
+
+  if(adjustctl(t ? MSR_IA32_VMX_TRUE_PINBASED_CTLS :
+                   MSR_IA32_VMX_PINBASED_CTLS,
+               /*
+                * Pin-based: exit on external interrupts (so the host
+                * kernel, not the guest, handles them) and on NMIs.
+                */
+               PIN_EXTINT_EXITING | PIN_NMI_EXITING, &pin) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_PROCBASED_CTLS :
+                   MSR_IA32_VMX_PROCBASED_CTLS,
+               /*
+                * Primary processor-based: exit on HLT, exit on every
+                * IN/OUT (no I/O bitmap), and enable the secondary
+                * controls word, which holds EPT and unrestricted guest.
+                */
+               CPU_HLT_EXITING | CPU_UNCOND_IO_EXITING | CPU_ACTIVATE_SECONDARY,
+               &cpu) < 0 ||
+     adjustctl(MSR_IA32_VMX_PROCBASED_CTLS2,
+               /*
+                * Secondary: nested paging via EPT, and unrestricted
+                * guest (lets the guest run with CR0.PE/PG off, i.e.
+                * real or paging-less protected mode).  Unrestricted
+                * guest requires EPT.
+                */
+               CPU2_ENABLE_EPT | CPU2_UNRESTRICTED_GUEST, &cpu2) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_EXIT_CTLS : MSR_IA32_VMX_EXIT_CTLS,
+               /*
+                * Exit: the host is a 64-bit kernel, so the processor
+                * must return to 64-bit mode (HOST_ADDR_SPACE_SIZE);
+                * save the guest's EFER into the VMCS on exit and load
+                * the host's EFER from the VMCS.  "Acknowledge
+                * interrupt on exit" is deliberately not set.
+                */
+               EXIT_HOST_ADDR_SPACE_SIZE | EXIT_SAVE_IA32_EFER |
+               EXIT_LOAD_IA32_EFER, &exitctl) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_ENTRY_CTLS : MSR_IA32_VMX_ENTRY_CTLS,
+               /*
+                * Entry: load the guest's EFER from the VMCS.  The
+                * "IA-32e mode guest" bit is set later, in vmrun(),
+                * according to the guest's EFER.LMA.
+                */
+               ENTRY_LOAD_IA32_EFER, &entryctl) < 0)
+    return -1;
+
+  /* Refuse a CPU that forces unwanted exits. */
+  if(cpu & (CPU_CR3_LOAD_EXITING | CPU_CR3_STORE_EXITING |
+            CPU_USE_IO_BITMAPS | CPU_USE_MSR_BITMAPS)){
+    cprintf("vmx: CPU forces unwanted exiting controls 0x%x\n", (uint64)cpu);
+    return -1;
+  }
+
+  /* Write the control fields. */
+  vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin);
+  vmwrite(CPU_BASED_VM_EXEC_CONTROL, cpu);
+  vmwrite(SECONDARY_VM_EXEC_CONTROL, cpu2);
+  vmwrite(VM_EXIT_CONTROLS, exitctl);
+  vmwrite(VM_ENTRY_CONTROLS, entryctl);
+
+  /* Exception bitmap: no guest IDT, so exit on everything. */
+  vmwrite(EXCEPTION_BITMAP, 0xFFFFFFFF);
+  /*
+   * For page faults the mask/match pair further filters which error
+   * codes exit; with all bits set in the bitmap, mask = match = 0
+   * means "every page fault exits" (SDM 27.6.3).
+   */
+  vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0);
+  vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+
+  /* Disable optional features. */
+  /* No CR3-target values (they would let some MOV to CR3 skip exiting). */
+  vmwrite(CR3_TARGET_COUNT, 0);
+  /* No MSR save/load lists on exit or entry. */
+  vmwrite(VM_EXIT_MSR_STORE_COUNT, 0);
+  vmwrite(VM_EXIT_MSR_LOAD_COUNT, 0);
+  vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 0);
+  /* Don't inject any event (interrupt/exception) on VM entry. */
+  vmwrite(VM_ENTRY_INTR_INFO_FIELD, 0);
+  /* Tell the processor where this guest's EPT lives (SDM 27.6.11). */
+  vmwrite(EPT_POINTER, vm->eptp);
+
+  /* Control register ownership and the host return address. */
+  vmwrite(CR0_GUEST_HOST_MASK, 0);
+  vmwrite(CR0_READ_SHADOW, 0);
+  vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
+  vmwrite(CR4_READ_SHADOW, 0);
+
+  vmwrite(HOST_RIP, (uint64)vmx_exit);
+
+  /* Guest control registers. */
+  cr0 = CR0_PE | CR0_ET | CR0_NE;
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0) & ~(uint64)(CR0_PE | CR0_PG);
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1);
+
+  cr4 = CR4_VMXE | rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  vmwrite(GUEST_CR0, cr0);
+  /* CR3 is irrelevant until the guest turns paging on. */
+  vmwrite(GUEST_CR3, 0);
+  vmwrite(GUEST_CR4, cr4);
+  /* DR7 reset value (bit 10 is reserved-1): no hardware breakpoints. */
+  vmwrite(GUEST_DR7, 0x400);
+
+  /* Guest segment registers. */
+  guestseg(SEG_CS, 0x08, 0, 0xFFFFFFFF, AR_CODE32);
+  for(seg = SEG_ES; seg <= SEG_GS; seg++)
+    if(seg != SEG_CS)
+      guestseg(seg, 0x10, 0, 0xFFFFFFFF, AR_DATA32);
+  /*
+   * LDTR is marked unusable (as after reset, no LDT), and TR must be
+   * valid for VM entry: a busy TSS (32-bit, limit 0xFFFF) is the
+   * simplest value that passes the guest-state checks of SDM 29.3.1.2.
+   */
+  guestseg(SEG_LDTR, 0, 0, 0, AR_UNUSABLE);
+  guestseg(SEG_TR, 0, 0, 0xFFFF, AR_TSS32_BUSY);
+
+  /* Descriptor tables. */
+  vmwrite(GUEST_GDTR_BASE, 0);
+  vmwrite(GUEST_GDTR_LIMIT, 0);
+  vmwrite(GUEST_IDTR_BASE, 0);
+  vmwrite(GUEST_IDTR_LIMIT, 0);
+
+  /* The rest of the guest state. */
+  vmwrite(GUEST_INTERRUPTIBILITY_INFO, 0);
+  vmwrite(GUEST_ACTIVITY_STATE, 0);
+  vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+  /* No shadow VMCS: the link pointer must be all ones. */
+  vmwrite(VMCS_LINK_POINTER, ~0ULL);
+  /* Remaining MSR-backed guest state: all zero. */
+  vmwrite(GUEST_IA32_DEBUGCTL, 0);
+  vmwrite(GUEST_SYSENTER_CS, 0);
+  vmwrite(GUEST_SYSENTER_ESP, 0);
+  vmwrite(GUEST_SYSENTER_EIP, 0);
+
+  cprintf("vmcs: cpu2=0x%x cr0=0x%x cr4=0x%x link=0x%x\n",
+        vmread(SECONDARY_VM_EXEC_CONTROL), vmread(GUEST_CR0),
+        vmread(GUEST_CR4), vmread(VMCS_LINK_POINTER));
   return 0;
 }
 
@@ -343,6 +501,7 @@ vmxhoststate(void)
 }
 
 /*
+*
  * Return the address of the EPT entry that maps guest-physical
  * address gpa.  If alloc is set, create any missing EPT tables.
  * Returns 0 if a table is missing and alloc is clear, or on
@@ -363,13 +522,11 @@ eptwalk(uint64 *pml4, uint64 gpa, int alloc)
   char *next;
   int level;
 
-  for (level = 3; level > 0; level--) {
-    // be cause we are traveling backward, we are going to ready from
-    // the begining of address:
-    // 47, 38, 29
-    e = &table[(gpa >> (12 + 9 *level)) & 0x1FF];
-    if (*e & EPT_RWX) {
-      // at least one bit in 0:2 is set, range is present bit (51:12) are phiscal 
+  for(level = 3; level > 0; level--){
+    /* Shifts 39, 30, 21: PML4, PDPT, PD. */
+    e = &table[(gpa >> (12 + 9*level)) & 0x1FF];
+    if(*e & EPT_RWX){
+      // at least one bit in 0:2 is set, range is present bit (51:12) are phiscal
       // address of the nexxt table.
       // kernel only work with virtual address, so we convert table address
       // to virtual
@@ -377,7 +534,7 @@ eptwalk(uint64 *pml4, uint64 gpa, int alloc)
     } else {
       // entry is not present, we try to create tables if `alloc` is set
       // failed to alloc a page to hold the next page table level
-      if (!alloc || (next = kalloc()) == 0) 
+      if(!alloc || (next = kalloc()) == 0)
         return 0;
       memset(next, 0, PGSIZE);
       // kalloc return virtual address, but we must store physical address
@@ -465,7 +622,7 @@ vmcreate(char *image, int len, int memsz)
   int id, n, off, r;
 
   /* HW1 part 2: write this function; see HW1.md. */
-  if (memsz <= 0 || memsz > VM_MAXMEM || len < 0 || VM_LOAD_ADDR + len > memsz)
+  if(memsz <= 0 || memsz > VM_MAXMEM || len < 0 || VM_LOAD_ADDR + len > memsz)
     return -1;
   // B2: Check that this CPU is in VMX operation
   // save current flags and disable interrupt (so we will not jump to another cpu
@@ -473,23 +630,23 @@ vmcreate(char *image, int len, int memsz)
   pushcli();
   r = mycpu()->vmx_ok;
   popcli();
-  if (!r)
+  if(!r)
     return -1;
   // B3: Check the EPT capabilites
   need = EPT_CAP_WALK_4 | EPT_CAP_MEMTYPE_WB | EPT_CAP_INVEPT|EPT_CAP_INVEPT_SINGLE;
-  if ((rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) & need) != need) {
+  if((rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) & need) != need) {
     cprintf("vmx: CPU lacks required EPT features\n");
     return -1;
   }
   // B4: Claim a slot in the VM table
   acquire(&vms.lock);
-  for (id = 0; id < NVM; id++) {
+  for(id = 0; id < NVM; id++) {
     // found an empty slot
-    if (!vms.vm[id].used)
+    if(!vms.vm[id].used)
       break;
   }
   // out of slots
-  if (id == NVM) {
+  if(id == NVM) {
     release(&vms.lock);
     return -1;
   }
@@ -504,21 +661,21 @@ vmcreate(char *image, int len, int memsz)
   vm->rflags = 0x2;
 
   // B5: Allocate the VMCS page
-  if ((vm->vmcs = kalloc()) == 0) {
+  if((vm->vmcs = kalloc()) == 0) {
     goto bad;
   }
   memset(vm->vmcs,0, PGSIZE);
-  
+
   //B6: Allocate the EPT root abd build the EPTP
-  if ((vm->ept = (uint64*)kalloc()) == 0) {
+  if((vm->ept = (uint64*)kalloc()) == 0) {
     goto bad; // can not allocate page to store ept
   }
   memset(vm->ept, 0, PGSIZE); // must be zeroed, (so bit present is not set)
-  // EPT pointer 
+  // EPT pointer
   vm->eptp = V2P(vm->ept) |  EPTP_WALK_4 | EPTP_MEMTYPE_WB;
 
   // B7: Allocate and map the guest’s memory
-  for (gpa = 0; gpa < vm->memsz; gpa += PGSIZE) {
+  for(gpa = 0; gpa < vm->memsz; gpa += PGSIZE) {
     // for each guest memory page, try to create a PT entry
     if((pte = eptwalk(vm->ept, gpa, 1)) == 0 || (mem = kalloc()) == 0)
       goto bad;
@@ -542,7 +699,7 @@ vmcreate(char *image, int len, int memsz)
   pte = eptwalk(vm->ept, VM_LOAD_ADDR, 0);
   cprintf("image word %x, guest word %x\n", (uint64)*(uint*)image,
           (uint64)*(uint*)P2V(EPT_ADDR(*pte)));
-  // Step B9: Prepare the VMCS 
+  // Step B9: Prepare the VMCS
   *(uint*)vm->vmcs = vmcs_revision;
   pushcli();
   if(!mycpu()->vmx_ok || vmclear(V2P(vm->vmcs)) < 0 || vmptrld(V2P(vm->vmcs)) < 0){
